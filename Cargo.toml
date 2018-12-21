@@ -1,0 +1,8 @@
+[package]
+name = "rust-bitcoind-http"
+version = "0.1.0"
+authors = ["Sebastian Geisler <sebastian@gnet.me>"]
+
+[dependencies]
+http = "0.1"
+jsonrpc = {git = "https://github.com/sgeisler/rust-jsonrpc.git", branch = "roundtripper"}
