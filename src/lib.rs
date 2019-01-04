@@ -45,13 +45,13 @@ impl SimpleBitcoindClientBuilder {
 
     /// Sets the port that the client will connect to in case none was specified in the URL of the
     /// request.
-    pub fn default_port(&mut self, port: u16) -> &mut Self {
+    pub fn default_port(mut self, port: u16) -> Self {
         self.client.default_port = port;
         self
     }
 
     /// Sets the timeout after which requests will abort if they aren't finished
-    pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
+    pub fn timeout(mut self, timeout: Duration) -> Self {
         self.client.timeout = timeout;
         self
     }
@@ -82,6 +82,8 @@ fn get_line<R: BufRead>(reader: &mut R, deadline: Instant) -> Result<String, Err
         match reader.read_line(&mut line) {
             // EOF reached for now, try again later
             Ok(0) => std::thread::yield_now(),
+            // Socket would block, try again later
+            Err(ref se) if se.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
             // received useful data, return it
             Ok(_) => return Ok(line),
             // io error occurred, abort
@@ -115,6 +117,7 @@ impl HttpRoundTripper for SimpleBitcoindClient {
         // Open connection
         let request_deadline = Instant::now() + self.timeout;
         let mut sock = TcpStream::connect(server)?;
+        sock.set_nonblocking(true);
 
         // Send HTTP request
         sock.write_all(format!("{} {} HTTP/1.0\r\n", method, uri).as_bytes())?;
@@ -167,6 +170,19 @@ pub enum Error {
     Timeout,
 }
 
+impl PartialEq for Error {
+    fn eq(&self, other: &Error) -> bool {
+        match (self, other) {
+            (Error::NoHost, Error::NoHost) => true,
+            (Error::SocketError(s), Error::SocketError(o)) => s.kind() == o.kind(),
+            (Error::HttpParseError, Error::HttpParseError) => true,
+            (Error::ErrorCode(s), Error::ErrorCode(o)) => s == o,
+            (Error::Timeout, Error::Timeout) => true,
+            _ => false,
+        }
+    }
+}
+
 impl std::error::Error for Error {
     fn description(&self) -> &'static str {
         match *self {
@@ -202,5 +218,109 @@ impl From<std::io::Error> for Error {
 
 #[cfg(test)]
 mod tests {
+    use ::{Error, SimpleBitcoindClient};
+    use http::Request;
+    use jsonrpc::client::HttpRoundTripper;
+    use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
+    fn simple_bitcoind_like_http_server(running: Arc<AtomicBool>) {
+        println!("starting test server");
+        let listener = TcpListener::bind("127.0.0.1:8332").unwrap();
+        listener.set_nonblocking(true);
+
+        'server: while running.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok(connection) => {
+                    let mut writer = BufWriter::new(connection.0.try_clone().unwrap());
+                    let mut reader = BufReader::new(connection.0.try_clone().unwrap());
+
+                    let req_header = 'connection: loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => thread::yield_now(),
+                            Ok(_) => break 'connection line,
+                            Err(e) => {
+                                eprintln!("Connection closed unexpectedly: {}", e);
+                                continue 'server
+                            },
+                        }
+                    };
+
+                    let response = match req_header.as_str() {
+                        "POST /invalid-header HTTP/1.0\r\n" => "Test\r\n",
+                        "POST /stall HTTP/1.0\r\n" => {
+                            thread::sleep(Duration::from_secs(8));
+                            ""
+                        },
+                        "POST /server-error HTTP/1.0\r\n" => "HTTP/1.0 500 Error\r\n\r\n",
+                        "POST /close HTTP/1.0\r\n" => "",
+                        r => panic!("Unexpected request: {}", r),
+                    };
+
+                    writer.write_all(response.as_bytes());
+                    writer.flush();
+                },
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    thread::yield_now();
+                },
+                Err(e) => {
+                    panic!("The server crashed: {}", e);
+                }
+            }
+        }
+        println!("stopping test server")
+    }
+
+    #[test]
+    fn tets_with_local_server() {
+        let run_server = Arc::new(AtomicBool::new(true));
+        let run_server_t = run_server.clone();
+        let server_thread = thread::spawn(move || simple_bitcoind_like_http_server(run_server_t));
+
+        let client = SimpleBitcoindClient::builder()
+            .timeout(Duration::from_secs(4))
+            .build();
+
+        // Test invalid response header
+        let request = Request::builder()
+            .uri("http://localhost/invalid-header")
+            .method("POST")
+            .body("{}".as_bytes())
+            .unwrap();
+        assert_eq!(client.request(request).unwrap_err(), Error::HttpParseError);
+
+        // Test timeout
+        let request = Request::builder()
+            .uri("http://localhost/stall")
+            .method("POST")
+            .body("{}".as_bytes())
+            .unwrap();
+        assert_eq!(client.request(request).unwrap_err(), Error::Timeout);
+        thread::sleep(Duration::from_secs(2));
+
+        // Test server error
+        let request = Request::builder()
+            .uri("http://localhost/server-error")
+            .method("POST")
+            .body("{}".as_bytes())
+            .unwrap();
+        assert_eq!(client.request(request).unwrap_err(), Error::ErrorCode(500));
+
+        // Test server error
+        let request = Request::builder()
+            .uri("http://localhost/close")
+            .method("POST")
+            .body("{}".as_bytes())
+            .unwrap();
+        let socket_error = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "");
+        assert_eq!(client.request(request).unwrap_err(), Error::SocketError(socket_error));
+
+        run_server.store(false, Ordering::Relaxed);
+        server_thread.join();
+    }
 }
